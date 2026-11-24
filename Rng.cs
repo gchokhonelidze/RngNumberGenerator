@@ -1,7 +1,6 @@
-﻿using System.Security.Cryptography;
+﻿using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
-using Menso.Tools.Scrambler;
-using MessagePack;
 
 namespace Flappybet;
 
@@ -15,7 +14,8 @@ public static class Rng
 		return sb.ToString();
 	}
 
-	public static byte[] ToBytes(object o) => MessagePackSerializer.Serialize(o);
+	/// <summary>UTF-8 bytes of the string</summary>
+	public static byte[] ToBytes(string s) => Encoding.UTF8.GetBytes(s);
 
 	public static byte[] Sha1(string s) => SHA1.HashData(ToBytes(s));
 
@@ -45,36 +45,51 @@ public static class Rng
 			throw new ArgumentException($"hex length is not enough to make symmetrical randomization spread for {n} outcomes");
 	}
 
-	/// <summary>Returns random int result from (0) to (n-1) inclusive</summary>
-	public static int Rand(string hex, int n)
-	{
-		ValidateHexLength(hex, n);
-		hex = hex.Length > 15 ? hex[..15] : hex;
-		decimal v = long.Parse(hex, System.Globalization.NumberStyles.HexNumber);
-		decimal max = (decimal)Math.Pow(2, hex.Length * 4);
-		int random = (int)Math.Floor(v / max * n);
-		return random;
-	}
+	/// <summary>Returns random int result from (0) to (n-1) inclusive. Same draw as RandLong</summary>
+	public static int Rand(string hex, int n) => (int)RandLong(hex, n);
 
-	/// <summary>Returns random long result from (0) to (n-1) inclusive</summary>
+	/// <summary>Returns random long result from (0) to (n-1) inclusive, every outcome equally likely.
+	/// The first L = min(hex.Length, 15) hex digits are read as an integer v in 0..16^L-1 and scaled to floor(v * n / 16^L) in exact integer arithmetic.
+	/// A draw is rejected when (v * n) mod 16^L is below 16^L mod n, which leaves exactly floor(16^L / n) accepted values of v per outcome.
+	/// A rejected draw is replaced by the first L hex digits of DeriveHash(hex, attempt), attempt = 1, 2, ... so the result depends on hex and n only.</summary>
 	public static long RandLong(string hex, long n)
 	{
 		ValidateHexLength(hex, n);
-		hex = hex.Length > 15 ? hex[..15] : hex;
-		decimal v = long.Parse(hex, System.Globalization.NumberStyles.HexNumber);
-		decimal max = (decimal)Math.Pow(2, hex.Length * 4);
-		long random = (long)Math.Floor(v / max * n);
-		return random;
+		int digits = Math.Min(hex.Length, MaxHexDigits);
+		int bits = digits * 4;
+		ulong range = 1UL << bits; //16^digits, at most 2^60
+		ulong outcomes = (ulong)n;
+		ulong threshold = range % outcomes;
+		string draw = hex;
+		for (int attempt = 1; ; attempt++)
+		{
+			ulong v = ulong.Parse(draw.AsSpan(0, digits), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture);
+			UInt128 scaled = (UInt128)v * outcomes; //below 2^120
+			if ((ulong)(scaled & (range - 1)) >= threshold)
+				return (long)(scaled >> bits);
+			draw = DeriveHash(hex, attempt);
+		}
 	}
+
+	/// <summary>Max hex digits read per draw: 60 bits</summary>
+	private const int MaxHexDigits = 15;
+
+	/// <summary>Hex of SHA-256 over UTF-8 of "{seed in lowercase}:{index}". Its own derivation, so it never repeats a RotateHash value</summary>
+	private static string DeriveHash(string seed, int index) =>
+		Convert.ToHexStringLower(SHA256.HashData(ToBytes($"{seed.ToLowerInvariant()}:{index}")));
 
 	public static string RotateHash(string hash, int nonce) => BytesToString(Sha1($"{hash}{nonce}"));
 
-	/// <summary>Shuffles array using Fisher-Yates algorithm. Does not mutate input array</summary>
+	/// <summary>Shuffles array using Fisher-Yates algorithm, every ordering equally likely. Does not mutate input array.
+	/// For i = last index down to 1, item i is swapped with item j = Rand(DeriveHash(hash + ":shuffle", i), i + 1). The whole hash is the seed.</summary>
 	public static IList<T> Shuffle<T>(IList<T> arr, string hash)
 	{
-		var seed = int.Parse(hash[..8], System.Globalization.NumberStyles.HexNumber);
 		IList<T> copy = [.. arr];
-		copy.Shuffle(seed);
+		for (int i = copy.Count - 1; i > 0; i--)
+		{
+			int j = Rand(DeriveHash($"{hash}:shuffle", i), i + 1);
+			(copy[i], copy[j]) = (copy[j], copy[i]);
+		}
 		return copy;
 	}
 }
